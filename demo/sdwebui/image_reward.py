@@ -11,6 +11,9 @@ from modules.processing import (
 import modules.images as images
 from modules.shared import opts, cmd_opts, state
 
+from modules import script_callbacks
+from modules.script_callbacks import ImageSaveParams
+
 import torch
 import os
 import sys
@@ -20,6 +23,8 @@ import ImageReward as reward
 def unload_image_reward_model():
     del shared.image_reward_model
 
+scores = {}
+using_image_reward = False
 
 class Script(scripts.Script):
     def title(self):
@@ -69,15 +74,25 @@ class Script(scripts.Script):
             lower_score_limit = float(lower_score_limit)
 
         # generate images
+        scores.clear()
+        global using_image_reward
+        using_image_reward = True
         proc = process_images(p)
+        using_image_reward = False
 
         # score
         gens = proc.images
+        index = 0
         for img in gens:
-            with torch.no_grad():
-                score = shared.image_reward_model.score(p.prompt, img)
-            img.info["score"] = score
-            img.info["parameters"] += f"\n ImageReward Score: {score:.4f}"
+            score = None
+            if index >= proc.index_of_first_image:
+                seed = proc.seed + index - proc.index_of_first_image
+                if seed in scores:
+                    score = scores[seed]
+            if score is not None:
+                img.info["score"] = score
+                img.info["parameters"] += f", ImageReward Score: {score:.4f}"
+            index += 1
 
         # filter out images with scores lower than the lower limit
         if filter_out_low_scores:
@@ -90,7 +105,7 @@ class Script(scripts.Script):
 
         # sort to score
         img_info_list = list(zip(imgs, infotexts))
-        img_info_list.sort(key=lambda x: x[0].info["score"], reverse=True)
+        img_info_list.sort(key=lambda x: x[0].info["score"] if "score" in x[0].info else 100000, reverse=True)
         imgs, infotexts = list(zip(*img_info_list))
 
         # return Processed object
@@ -102,3 +117,18 @@ class Script(scripts.Script):
             infotexts=infotexts,
             index_of_first_image=proc.index_of_first_image,
         )
+
+def on_before_image_saved(params: ImageSaveParams):
+    global using_image_reward
+    if not using_image_reward:
+        return
+    with torch.no_grad():
+        score = shared.image_reward_model.score(params.p.prompt, params.image)
+        seed = int(params.pnginfo["parameters"].split("Seed: ")[1].split(",")[0])
+        scores[seed] = score
+        params.pnginfo["parameters"] += f", ImageReward Score: {score:.4f}"
+
+    return params
+
+
+script_callbacks.on_before_image_saved(on_before_image_saved)
